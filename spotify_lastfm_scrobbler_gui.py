@@ -1,191 +1,286 @@
+# --- FILE: spotify_lastfm_scrobbler_gui.py ---
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Spotify → Last.fm Scrobbler (GUI) — v0.8
+- Tk/ttk UI, progress bar, collapsible Advanced options.
+- Buttons: Authenticate/Reset, Probe, Start, Open Log.
+- Mirrors CLI features: include duration, omit chosenByUser, date range, debug.
+"""
 
-import os
+from __future__ import annotations
+
 import threading
 import time
-import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext
 from pathlib import Path
 from typing import List
 
-try:
-    # Import scrobbling functions from the CLI script.  If you move this
-    # file, make sure to adjust the import accordingly.
-    from spotify_lastfm_scrobbler import (
-        load_config,
-        save_config,
-        authenticate_interactively,
-        parse_streaming_history,
-        should_scrobble,
-        compute_start_timestamp,
-        submit_batch,
-    )
-except Exception as exc:
-    raise RuntimeError(
-        "Failed to import scrobbling functions. Ensure that "
-        "spotify_lastfm_scrobbler.py is located next to this script."
-    ) from exc
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
 
+# Import core functions from CLI module (must be alongside this file)
+from spotify_lastfm_scrobbler import (
+    load_config,
+    save_config,
+    delete_config,
+    authenticate_interactively,
+    parse_streaming_history,
+    should_scrobble,
+    compute_start_timestamp,
+    submit_batch,
+)
+
+DEBUG_LOG = Path("scrobble_debug.log")
 
 class ScrobbleGUI(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Spotify → Last.fm Scrobbler")
-        self.geometry("600x500")
-        self.resizable(False, False)
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
-        # Load stored config if available
-        self.config_data = load_config()
-        # UI variables
-        self.var_api_key = tk.StringVar(value=self.config_data.get("api_key", ""))
-        self.var_api_secret = tk.StringVar(value=self.config_data.get("api_secret", ""))
-        self.var_session_key = tk.StringVar(value=self.config_data.get("session_key", ""))
-        self.var_input_paths = tk.StringVar()
+        self.geometry("760x640")
+        self.minsize(720, 600)
+        self.style = ttk.Style(self)
+        # Prefer a modern theme if available
+        for theme in ("vista", "xpnative", "clam"):  # best-effort on Windows/mac/Linux
+            try:
+                self.style.theme_use(theme)
+                break
+            except Exception:
+                continue
+
+        self.cfg = load_config()
+        self.vars = {
+            "api_key": tk.StringVar(value=self.cfg.get("api_key", "")),
+            "api_secret": tk.StringVar(value=self.cfg.get("api_secret", "")),
+            "session_key": tk.StringVar(value=self.cfg.get("session_key", "")),
+            "paths_str": tk.StringVar(value=""),
+            "since": tk.StringVar(value=""),
+            "until": tk.StringVar(value=""),
+            "include_duration": tk.BooleanVar(value=True),
+            "no_chosen": tk.BooleanVar(value=False),
+            "debug": tk.BooleanVar(value=True),
+            "dry_run": tk.BooleanVar(value=False),
+            "limit": tk.StringVar(value="")
+        }
         self.selected_paths: List[str] = []
-        # Build UI
-        self.create_widgets()
+        self._build_ui()
 
-    def create_widgets(self) -> None:
-        # API Key
-        lbl_key = tk.Label(self, text="API Key:")
-        lbl_key.grid(row=0, column=0, sticky="e", padx=5, pady=5)
-        ent_key = tk.Entry(self, textvariable=self.var_api_key, width=50)
-        ent_key.grid(row=0, column=1, columnspan=2, sticky="w", padx=5, pady=5)
-        # API Secret
-        lbl_secret = tk.Label(self, text="API Secret:")
-        lbl_secret.grid(row=1, column=0, sticky="e", padx=5, pady=5)
-        ent_secret = tk.Entry(self, textvariable=self.var_api_secret, width=50)
-        ent_secret.grid(row=1, column=1, columnspan=2, sticky="w", padx=5, pady=5)
-        # Session Key (optional)
-        lbl_sk = tk.Label(self, text="Session Key (opt):")
-        lbl_sk.grid(row=2, column=0, sticky="e", padx=5, pady=5)
-        ent_sk = tk.Entry(self, textvariable=self.var_session_key, width=50)
-        ent_sk.grid(row=2, column=1, columnspan=2, sticky="w", padx=5, pady=5)
-        # Input selection
-        lbl_input = tk.Label(self, text="Input Files/Dir:")
-        lbl_input.grid(row=3, column=0, sticky="e", padx=5, pady=5)
-        ent_input = tk.Entry(self, textvariable=self.var_input_paths, width=40, state="readonly")
-        ent_input.grid(row=3, column=1, sticky="w", padx=5, pady=5)
-        btn_browse_files = tk.Button(self, text="Browse Files", command=self.select_files)
-        btn_browse_files.grid(row=3, column=2, padx=5, pady=5)
-        btn_browse_dir = tk.Button(self, text="Browse Dir", command=self.select_directory)
-        btn_browse_dir.grid(row=4, column=2, padx=5, pady=5)
-        # Run button
-        self.btn_run = tk.Button(self, text="Start Scrobbling", command=self.start_scrobbling)
-        self.btn_run.grid(row=4, column=1, sticky="w", padx=5, pady=5)
-        # Output area
-        self.txt_output = scrolledtext.ScrolledText(self, height=20, width=70, state="disabled")
-        self.txt_output.grid(row=5, column=0, columnspan=3, padx=5, pady=5)
+    # UI layout
+    def _build_ui(self) -> None:
+        pad = {"padx": 10, "pady": 6}
 
-    def log(self, message: str) -> None:
-        """Append a message to the output area."""
-        self.txt_output.configure(state="normal")
-        self.txt_output.insert(tk.END, message + "\n")
-        self.txt_output.configure(state="disabled")
-        self.txt_output.see(tk.END)
+        top = ttk.Frame(self)
+        top.pack(fill="x", **pad)
 
-    def select_files(self) -> None:
+        ttk.Label(top, text="API Key:").grid(row=0, column=0, sticky="e")
+        ttk.Entry(top, textvariable=self.vars["api_key"], width=48).grid(row=0, column=1, sticky="we")
+        ttk.Button(top, text="Authenticate", command=self.on_auth).grid(row=0, column=2, sticky="w")
+
+        ttk.Label(top, text="API Secret:").grid(row=1, column=0, sticky="e")
+        ttk.Entry(top, textvariable=self.vars["api_secret"], width=48, show="•").grid(row=1, column=1, sticky="we")
+        ttk.Button(top, text="Reset Auth", command=self.on_reset_auth).grid(row=1, column=2, sticky="w")
+
+        ttk.Label(top, text="Session Key (optional):").grid(row=2, column=0, sticky="e")
+        ttk.Entry(top, textvariable=self.vars["session_key"], width=48).grid(row=2, column=1, sticky="we")
+        ttk.Button(top, text="Probe", command=self.on_probe).grid(row=2, column=2, sticky="w")
+
+        top.columnconfigure(1, weight=1)
+
+        pathf = ttk.LabelFrame(self, text="Input")
+        pathf.pack(fill="x", **pad)
+        ttk.Entry(pathf, textvariable=self.vars["paths_str"], state="readonly").grid(row=0, column=0, sticky="we")
+        ttk.Button(pathf, text="Browse Files", command=self.on_browse_files).grid(row=0, column=1, sticky="w")
+        ttk.Button(pathf, text="Browse Folder", command=self.on_browse_dir).grid(row=0, column=2, sticky="w")
+        pathf.columnconfigure(0, weight=1)
+
+        adv = ttk.LabelFrame(self, text="Advanced")
+        adv.pack(fill="x", **pad)
+        ttk.Checkbutton(adv, text="Include duration", variable=self.vars["include_duration"]).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(adv, text="Omit chosenByUser", variable=self.vars["no_chosen"]).grid(row=0, column=1, sticky="w")
+        ttk.Checkbutton(adv, text="Debug log", variable=self.vars["debug"]).grid(row=0, column=2, sticky="w")
+        ttk.Checkbutton(adv, text="Dry run (no writes)", variable=self.vars["dry_run"]).grid(row=0, column=3, sticky="w")
+        ttk.Label(adv, text="Since (YYYY-MM-DD):").grid(row=1, column=0, sticky="e")
+        ttk.Entry(adv, textvariable=self.vars["since"], width=14).grid(row=1, column=1, sticky="w")
+        ttk.Label(adv, text="Until (YYYY-MM-DD):").grid(row=1, column=2, sticky="e")
+        ttk.Entry(adv, textvariable=self.vars["until"], width=14).grid(row=1, column=3, sticky="w")
+        ttk.Label(adv, text="Limit (count):").grid(row=1, column=4, sticky="e")
+        ttk.Entry(adv, textvariable=self.vars["limit"], width=10).grid(row=1, column=5, sticky="w")
+
+        ctrl = ttk.Frame(self)
+        ctrl.pack(fill="x", **pad)
+        self.btn_start = ttk.Button(ctrl, text="Start Scrobbling", command=self.on_start)
+        self.btn_start.pack(side="left")
+        ttk.Button(ctrl, text="Open Log", command=self.on_open_log).pack(side="left", padx=8)
+
+        progf = ttk.Frame(self)
+        progf.pack(fill="x", **pad)
+        self.progress = ttk.Progressbar(progf, mode="determinate")
+        self.progress.pack(fill="x")
+
+        outf = ttk.LabelFrame(self, text="Output")
+        outf.pack(fill="both", expand=True, **pad)
+        self.txt = tk.Text(outf, height=18, font=("Consolas", 10))
+        self.txt.pack(fill="both", expand=True)
+
+    # UI helpers
+    def log(self, msg: str) -> None:
+        self.txt.insert("end", msg + "\n"); self.txt.see("end")
+
+    def on_browse_files(self) -> None:
         paths = filedialog.askopenfilenames(
-            parent=self,
-            title="Select JSON or ZIP files",
-            filetypes=[("JSON/ZIP", "*.json *.zip"), ("All files", "*.*")],
+            parent=self, title="Select JSON/ZIP files", filetypes=[("JSON/ZIP", "*.json *.zip"), ("All files", "*.*")]
         )
         if paths:
             self.selected_paths = list(paths)
-            self.var_input_paths.set("; ".join(paths))
+            self.vars["paths_str"].set("; ".join(paths))
 
-    def select_directory(self) -> None:
-        path = filedialog.askdirectory(parent=self, title="Select Directory")
+    def on_browse_dir(self) -> None:
+        path = filedialog.askdirectory(parent=self, title="Select Folder")
         if path:
             self.selected_paths = [path]
-            self.var_input_paths.set(path)
+            self.vars["paths_str"].set(path)
 
-    def start_scrobbling(self) -> None:
-        # Validate inputs
-        api_key = self.var_api_key.get().strip()
-        api_secret = self.var_api_secret.get().strip()
-        session_key = self.var_session_key.get().strip() or None
+    def on_open_log(self) -> None:
+        if DEBUG_LOG.exists():
+            try:
+                import os
+                os.startfile(str(DEBUG_LOG))  # Windows
+            except Exception:
+                messagebox.showinfo("Debug log", f"See {DEBUG_LOG.resolve()}")
+        else:
+            messagebox.showinfo("Debug log", "No log file found yet.")
+
+    def on_auth(self) -> None:
+        api_key = self.vars["api_key"].get().strip()
+        api_secret = self.vars["api_secret"].get().strip()
         if not api_key or not api_secret:
-            messagebox.showerror("Missing API Credentials", "Please enter your API key and secret.")
+            messagebox.showerror("Missing", "Enter API key and secret first.")
+            return
+        try:
+            sk = authenticate_interactively(api_key, api_secret)
+            self.vars["session_key"].set(sk)
+            cfg = load_config(); cfg.update({"api_key": api_key, "api_secret": api_secret, "session_key": sk}); save_config(cfg)
+            messagebox.showinfo("Authenticated", "Authorization successful and saved.")
+        except Exception as exc:
+            messagebox.showerror("Auth failed", str(exc))
+
+    def on_reset_auth(self) -> None:
+        delete_config(); self.vars["session_key"].set(""); messagebox.showinfo("Reset", "Cleared cached credentials.")
+
+    def on_probe(self) -> None:
+        api_key = self.vars["api_key"].get().strip(); api_secret = self.vars["api_secret"].get().strip()
+        if not api_key or not api_secret:
+            messagebox.showerror("Missing", "Enter API key and secret first.")
+            return
+        # Reuse CLI probe by calling a tiny run in a thread
+        self._run_thread(self._worker_probe, api_key, api_secret, self.vars["session_key"].get().strip())
+
+    def on_start(self) -> None:
+        api_key = self.vars["api_key"].get().strip(); api_secret = self.vars["api_secret"].get().strip()
+        if not api_key or not api_secret:
+            messagebox.showerror("Missing", "Enter API key and secret first.")
             return
         if not self.selected_paths:
-            messagebox.showerror("Missing Input", "Please select at least one file or directory.")
+            messagebox.showerror("Missing", "Select files or a folder.")
             return
-        # Disable run button
-        self.btn_run.configure(state="disabled")
-        # Clear output
-        self.txt_output.configure(state="normal")
-        self.txt_output.delete("1.0", tk.END)
-        self.txt_output.configure(state="disabled")
-        # Run scrobbling in a separate thread
-        threading.Thread(
-            target=self.scrobble_worker,
-            args=(api_key, api_secret, session_key, list(self.selected_paths)),
-            daemon=True,
-        ).start()
+        self.btn_start.configure(state="disabled")
+        self.progress.configure(value=0, maximum=100)
+        self.txt.delete("1.0", "end")
+        self._run_thread(self._worker_start, api_key, api_secret, self.vars["session_key"].get().strip(), list(self.selected_paths))
 
-    def scrobble_worker(self, api_key: str, api_secret: str, session_key: str, paths: List[str]) -> None:
+    def _run_thread(self, target, *args):
+        t = threading.Thread(target=target, args=args, daemon=True)
+        t.start()
+
+    # Workers
+    def _worker_probe(self, api_key: str, api_secret: str, session_key: str) -> None:
         try:
-            # Authenticate if necessary
+            from spotify_lastfm_scrobbler import run_probe
+            run_probe(api_key, api_secret, session_key, debug=self.vars["debug"].get())
+            self.log("Probe sent. Check Last.fm recent tracks and the debug log if enabled.")
+        except Exception as exc:
+            self.log(f"Probe failed: {exc}")
+
+    def _worker_start(self, api_key: str, api_secret: str, session_key: str, paths: List[str]) -> None:
+        try:
             if not session_key:
-                self.log("No session key provided – starting interactive authentication...")
-                session_key_new = authenticate_interactively(api_key, api_secret)
-                session_key = session_key_new
-                # Persist session key
-                self.config_data.update({"api_key": api_key, "api_secret": api_secret, "session_key": session_key})
-                save_config(self.config_data)
-            # Convert string paths to Path objects
-            path_objs = []
+                self.log("No session key — starting interactive auth...")
+                sk = authenticate_interactively(api_key, api_secret)
+                session_key = sk
+                cfg = load_config(); cfg.update({"api_key": api_key, "api_secret": api_secret, "session_key": sk}); save_config(cfg)
+                self.vars["session_key"].set(sk)
+
+            # Collect inputs
+            path_objs: List[Path] = []
             for p in paths:
                 po = Path(p)
-                if po.is_dir():
-                    for file in po.glob("*.json"):
-                        path_objs.append(file)
-                    for file in po.glob("*.zip"):
-                        path_objs.append(file)
-                else:
-                    path_objs.append(po)
-            self.log(f"Reading {len(path_objs)} input file(s)...")
+                path_objs.append(po)
+
+            self.log(f"Reading inputs ({len(path_objs)})...")
             entries = parse_streaming_history(path_objs)
             self.log(f"Loaded {len(entries)} total entries.")
+
             scrobs = [e for e in entries if should_scrobble(e)]
             self.log(f"{len(scrobs)} entries qualify for scrobbling.")
             if not scrobs:
                 self.log("Nothing to scrobble.")
-                return
-            # Deduplicate
-            seen = set()
-            unique = []
+                self.btn_start.configure(state="normal"); return
+
+            # Range filter, dedupe
+            since = self.vars["since"].get().strip() or None
+            until = self.vars["until"].get().strip() or None
+            def within(ts: int) -> bool:
+                from spotify_lastfm_scrobbler import within_range
+                return within_range(ts, since, until)
+
+            seen = set(); unique: List[dict] = []
             for e in scrobs:
                 ts = compute_start_timestamp(e)
+                if not within(ts):
+                    continue
                 key = (e.get("master_metadata_album_artist_name"), e.get("master_metadata_track_name"), ts)
                 if key not in seen:
                     seen.add(key)
                     unique.append(e)
-            self.log(f"{len(unique)} unique scrobbles after removing duplicates.")
-            # Sort chronologically
+
             unique.sort(key=lambda e: compute_start_timestamp(e))
-            batch_size = 50
+            limit_s = self.vars["limit"].get().strip()
+            if limit_s:
+                try:
+                    unique = unique[: max(0, int(limit_s))]
+                except Exception:
+                    pass
+
             total = len(unique)
+            self.log(f"{total} unique scrobbles after removing duplicates.")
+            if total == 0:
+                self.btn_start.configure(state="normal"); return
+
             submitted = 0
-            for i in range(0, total, batch_size):
-                batch = unique[i : i + batch_size]
-                self.log(f"Submitting scrobbles {i + 1}–{i + len(batch)} of {total}...")
-                ok = submit_batch(batch, api_key, api_secret, session_key, dry_run=False)
-                if ok:
-                    submitted += len(batch)
+            for i in range(0, total, 50):
+                batch = unique[i : i + 50]
+                self.log(f"Submitting scrobbles {i+1}–{i+len(batch)} of {total}...")
+                res = submit_batch(
+                    batch,
+                    api_key,
+                    api_secret,
+                    session_key,
+                    dry_run=self.vars["dry_run"].get(),
+                    debug=self.vars["debug"].get(),
+                    include_duration=self.vars["include_duration"].get(),
+                    send_chosen=(not self.vars["no_chosen"].get()),
+                )
+                if res.get("accepted", 0) > 0:
+                    submitted += min(50, len(batch))
                 else:
-                    self.log("Warning: some scrobbles may have failed.")
-                # small delay to avoid hammering the API
-                time.sleep(0.5)
-            self.log(f"Finished. {submitted} scrobbles submitted.")
+                    self.log(f"Warning: accepted={res.get('accepted',0)} ignored={res.get('ignored',0)}")
+                self.progress.configure(value=(i + len(batch)) * 100 / max(1, total))
+                time.sleep(0.5 if not self.vars["dry_run"].get() else 0)
+
+            self.log("Finished. " + (f"{submitted} processed (dry-run)." if self.vars["dry_run"].get() else f"{submitted} scrobbles submitted."))
         except Exception as exc:
             self.log(f"Error: {exc}")
         finally:
-            self.btn_run.configure(state="normal")
-
-    def on_close(self) -> None:
-        self.destroy()
+            self.btn_start.configure(state="normal")
 
 
 def main() -> None:
