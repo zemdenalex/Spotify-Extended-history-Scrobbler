@@ -1,292 +1,191 @@
-# --- FILE: spotify_lastfm_scrobbler_gui.py ---
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Spotify → Last.fm Scrobbler (GUI) — v0.8
-- Tk/ttk UI, progress bar, collapsible Advanced options.
-- Buttons: Authenticate/Reset, Probe, Start, Open Log.
-- Mirrors CLI features: include duration, omit chosenByUser, date range, debug.
-"""
-
-from __future__ import annotations
-
-import threading
-import time
-from pathlib import Path
-from typing import List
-
+import os, sys, subprocess, threading, queue, shlex, datetime as dt
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-# Import core functions from CLI module (must be alongside this file)
-from spotify_lastfm_scrobbler import (
-    load_config,
-    save_config,
-    delete_config,
-    authenticate_interactively,
-    parse_streaming_history,
-    should_scrobble,
-    compute_start_timestamp,
-    submit_batch,
-)
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+PY_EXE = sys.executable
 
-DEBUG_LOG = Path("scrobble_debug.log")
+def build_args(values: dict) -> list[str]:
+    args = [PY_EXE, os.path.join(APP_DIR, "spotify_lastfm_scrobbler.py")]
+    args += ["--input", values["input"]]
+    if values["since"]: args += ["--since", values["since"]]
+    if values["until"]: args += ["--until", values["until"]]
+    if values["limit"]: args += ["--limit", str(values["limit"])]
+    if values["include_duration"]: args += ["--include-duration"]
+    if values["no_chosen"]: args += ["--no-chosen-by-user"]
+    if values["import_mode"]:
+        args += ["--import-mode", "--gap-sec", str(values["gap"]), "--finish-at", values["finish_at"] or "now"]
+    if values["state_file"]:
+        args += ["--state-file", values["state_file"]]
+    if values["debug"]: args += ["--debug"]
+    return args
 
-class ScrobbleGUI(tk.Tk):
-    def __init__(self) -> None:
+class App(tk.Tk):
+    def __init__(self):
         super().__init__()
         self.title("Spotify → Last.fm Scrobbler")
-        self.geometry("760x640")
-        self.minsize(720, 600)
-        self.style = ttk.Style(self)
-        # Prefer a modern theme if available
-        for theme in ("vista", "xpnative", "clam"):  # best-effort on Windows/mac/Linux
-            try:
-                self.style.theme_use(theme)
-                break
-            except Exception:
-                continue
-
-        self.cfg = load_config()
-        self.vars = {
-            "api_key": tk.StringVar(value=self.cfg.get("api_key", "")),
-            "api_secret": tk.StringVar(value=self.cfg.get("api_secret", "")),
-            "session_key": tk.StringVar(value=self.cfg.get("session_key", "")),
-            "paths_str": tk.StringVar(value=""),
-            "since": tk.StringVar(value=""),
-            "until": tk.StringVar(value=""),
-            "include_duration": tk.BooleanVar(value=True),
-            "no_chosen": tk.BooleanVar(value=False),
-            "debug": tk.BooleanVar(value=True),
-            "dry_run": tk.BooleanVar(value=False),
-            "limit": tk.StringVar(value="")
-        }
-        self.selected_paths: List[str] = []
+        self.geometry("920x620")
+        self.proc = None
+        self.q = queue.Queue()
         self._build_ui()
 
-    # UI layout
-    def _build_ui(self) -> None:
-        pad = {"padx": 10, "pady": 6}
+    def _build_ui(self):
+        frm = ttk.Frame(self, padding=10)
+        frm.pack(fill="both", expand=True)
 
-        top = ttk.Frame(self)
-        top.pack(fill="x", **pad)
+        # input picker
+        self.input_var = tk.StringVar()
+        r = 0
+        ttk.Label(frm, text="Input (dir or ZIP/JSON):").grid(row=r, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.input_var, width=80).grid(row=r, column=1, sticky="we")
+        ttk.Button(frm, text="Browse", command=self.pick_input).grid(row=r, column=2, padx=5); r+=1
 
-        ttk.Label(top, text="API Key:").grid(row=0, column=0, sticky="e")
-        ttk.Entry(top, textvariable=self.vars["api_key"], width=48).grid(row=0, column=1, sticky="we")
-        ttk.Button(top, text="Authenticate", command=self.on_auth).grid(row=0, column=2, sticky="w")
+        # date filters
+        self.since_var = tk.StringVar(); self.until_var = tk.StringVar()
+        ttk.Label(frm, text="Since (YYYY-MM-DD):").grid(row=r, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.since_var, width=18).grid(row=r, column=1, sticky="w")
+        ttk.Label(frm, text="Until (YYYY-MM-DD):").grid(row=r, column=1, sticky="e", padx=(0,210))
+        ttk.Entry(frm, textvariable=self.until_var, width=18).grid(row=r, column=1, sticky="e"); r+=1
 
-        ttk.Label(top, text="API Secret:").grid(row=1, column=0, sticky="e")
-        ttk.Entry(top, textvariable=self.vars["api_secret"], width=48, show="•").grid(row=1, column=1, sticky="we")
-        ttk.Button(top, text="Reset Auth", command=self.on_reset_auth).grid(row=1, column=2, sticky="w")
+        # options
+        self.limit_var = tk.StringVar()
+        self.inc_dur_var = tk.BooleanVar(value=True)
+        self.no_chosen_var = tk.BooleanVar(value=True)
+        self.debug_var = tk.BooleanVar(value=False)
 
-        ttk.Label(top, text="Session Key (optional):").grid(row=2, column=0, sticky="e")
-        ttk.Entry(top, textvariable=self.vars["session_key"], width=48).grid(row=2, column=1, sticky="we")
-        ttk.Button(top, text="Probe", command=self.on_probe).grid(row=2, column=2, sticky="w")
+        ttk.Label(frm, text="Limit (optional):").grid(row=r, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.limit_var, width=10).grid(row=r, column=1, sticky="w")
+        ttk.Checkbutton(frm, text="Include duration", variable=self.inc_dur_var).grid(row=r, column=1, sticky="w", padx=(120,0))
+        ttk.Checkbutton(frm, text="No chosenByUser", variable=self.no_chosen_var).grid(row=r, column=1, sticky="w", padx=(270,0))
+        ttk.Checkbutton(frm, text="Debug log", variable=self.debug_var).grid(row=r, column=1, sticky="w", padx=(420,0)); r+=1
 
-        top.columnconfigure(1, weight=1)
+        # import mode
+        self.import_var = tk.BooleanVar(value=True)
+        self.gap_var = tk.StringVar(value="1")
+        self.finish_var = tk.StringVar(value="now")
+        self.state_var = tk.StringVar(value=os.path.join(APP_DIR, "lastfm_resume_state.json"))
 
-        pathf = ttk.LabelFrame(self, text="Input")
-        pathf.pack(fill="x", **pad)
-        ttk.Entry(pathf, textvariable=self.vars["paths_str"], state="readonly").grid(row=0, column=0, sticky="we")
-        ttk.Button(pathf, text="Browse Files", command=self.on_browse_files).grid(row=0, column=1, sticky="w")
-        ttk.Button(pathf, text="Browse Folder", command=self.on_browse_dir).grid(row=0, column=2, sticky="w")
-        pathf.columnconfigure(0, weight=1)
+        ttk.Checkbutton(frm, text="Import mode (re-date plays)", variable=self.import_var).grid(row=r, column=0, sticky="w")
+        ttk.Label(frm, text="Gap (sec):").grid(row=r, column=1, sticky="w")
+        ttk.Entry(frm, textvariable=self.gap_var, width=6).grid(row=r, column=1, sticky="w", padx=(65,0))
+        ttk.Label(frm, text='Finish at ("now" or ISO):').grid(row=r, column=1, sticky="w", padx=(120,0))
+        ttk.Entry(frm, textvariable=self.finish_var, width=22).grid(row=r, column=1, sticky="w", padx=(280,0)); r+=1
 
-        adv = ttk.LabelFrame(self, text="Advanced")
-        adv.pack(fill="x", **pad)
-        ttk.Checkbutton(adv, text="Include duration", variable=self.vars["include_duration"]).grid(row=0, column=0, sticky="w")
-        ttk.Checkbutton(adv, text="Omit chosenByUser", variable=self.vars["no_chosen"]).grid(row=0, column=1, sticky="w")
-        ttk.Checkbutton(adv, text="Debug log", variable=self.vars["debug"]).grid(row=0, column=2, sticky="w")
-        ttk.Checkbutton(adv, text="Dry run (no writes)", variable=self.vars["dry_run"]).grid(row=0, column=3, sticky="w")
-        ttk.Label(adv, text="Since (YYYY-MM-DD):").grid(row=1, column=0, sticky="e")
-        ttk.Entry(adv, textvariable=self.vars["since"], width=14).grid(row=1, column=1, sticky="w")
-        ttk.Label(adv, text="Until (YYYY-MM-DD):").grid(row=1, column=2, sticky="e")
-        ttk.Entry(adv, textvariable=self.vars["until"], width=14).grid(row=1, column=3, sticky="w")
-        ttk.Label(adv, text="Limit (count):").grid(row=1, column=4, sticky="e")
-        ttk.Entry(adv, textvariable=self.vars["limit"], width=10).grid(row=1, column=5, sticky="w")
+        ttk.Label(frm, text="State file:").grid(row=r, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.state_var, width=60).grid(row=r, column=1, sticky="we")
+        ttk.Button(frm, text="…", width=3, command=self.pick_state).grid(row=r, column=2); r+=1
 
-        ctrl = ttk.Frame(self)
-        ctrl.pack(fill="x", **pad)
-        self.btn_start = ttk.Button(ctrl, text="Start Scrobbling", command=self.on_start)
-        self.btn_start.pack(side="left")
-        ttk.Button(ctrl, text="Open Log", command=self.on_open_log).pack(side="left", padx=8)
+        # buttons
+        btns = ttk.Frame(frm); btns.grid(row=r, column=0, columnspan=3, pady=6, sticky="w")
+        ttk.Button(btns, text="Start / Resume", command=self.start).pack(side="left", padx=3)
+        ttk.Button(btns, text="Stop", command=self.stop).pack(side="left", padx=3)
+        ttk.Button(btns, text="Create Startup Task", command=self.create_task).pack(side="left", padx=12)
+        r+=1
 
-        progf = ttk.Frame(self)
-        progf.pack(fill="x", **pad)
-        self.progress = ttk.Progressbar(progf, mode="determinate")
-        self.progress.pack(fill="x")
+        # log
+        self.log = tk.Text(frm, height=20, wrap="word")
+        self.log.grid(row=r, column=0, columnspan=3, sticky="nsew")
+        frm.rowconfigure(r, weight=1)
+        frm.columnconfigure(1, weight=1)
 
-        outf = ttk.LabelFrame(self, text="Output")
-        outf.pack(fill="both", expand=True, **pad)
-        self.txt = tk.Text(outf, height=18, font=("Consolas", 10))
-        self.txt.pack(fill="both", expand=True)
+        self.after(200, self._drain_log)
 
-    # UI helpers
-    def log(self, msg: str) -> None:
-        self.txt.insert("end", msg + "\n"); self.txt.see("end")
+    def pick_input(self):
+        p = filedialog.askdirectory(title="Pick Spotify Extended Streaming History folder")
+        if p: self.input_var.set(p)
 
-    def on_browse_files(self) -> None:
-        paths = filedialog.askopenfilenames(
-            parent=self, title="Select JSON/ZIP files", filetypes=[("JSON/ZIP", "*.json *.zip"), ("All files", "*.*")]
-        )
-        if paths:
-            self.selected_paths = list(paths)
-            self.vars["paths_str"].set("; ".join(paths))
+    def pick_state(self):
+        p = filedialog.asksaveasfilename(title="Pick state file", defaultextension=".json",
+                                         initialfile="lastfm_resume_state.json")
+        if p: self.state_var.set(p)
 
-    def on_browse_dir(self) -> None:
-        path = filedialog.askdirectory(parent=self, title="Select Folder")
-        if path:
-            self.selected_paths = [path]
-            self.vars["paths_str"].set(path)
+    def append(self, line: str):
+        self.log.insert("end", line + "\n")
+        self.log.see("end")
 
-    def on_open_log(self) -> None:
-        if DEBUG_LOG.exists():
-            try:
-                import os
-                os.startfile(str(DEBUG_LOG))  # Windows
-            except Exception:
-                messagebox.showinfo("Debug log", f"See {DEBUG_LOG.resolve()}")
+    def _drain_log(self):
+        try:
+            while True:
+                self.append(self.q.get_nowait())
+        except queue.Empty:
+            pass
+        self.after(200, self._drain_log)
+
+    def _reader(self, proc: subprocess.Popen):
+        for line in iter(proc.stdout.readline, ""):
+            self.q.put(line.rstrip())
+        proc.wait()
+        rc = proc.returncode
+        self.q.put(f"\nProcess exit code: {rc}")
+
+    def start(self):
+        if self.proc and self.proc.poll() is None:
+            messagebox.showinfo("Already running", "The scrobbling process is already running.")
+            return
+        vals = {
+            "input": self.input_var.get().strip(),
+            "since": self.since_var.get().strip(),
+            "until": self.until_var.get().strip(),
+            "limit": self.limit_var.get().strip(),
+            "include_duration": self.inc_dur_var.get(),
+            "no_chosen": self.no_chosen_var.get(),
+            "debug": self.debug_var.get(),
+            "import_mode": self.import_var.get(),
+            "gap": int(self.gap_var.get() or "1"),
+            "finish_at": self.finish_var.get().strip() or "now",
+            "state_file": self.state_var.get().strip(),
+        }
+        if not vals["input"]:
+            messagebox.showerror("Missing input", "Please select your Spotify history folder/zip/json.")
+            return
+        if vals["limit"] and not vals["limit"].isdigit():
+            messagebox.showerror("Bad limit", "Limit must be a number.")
+            return
+
+        args = build_args(vals)
+        self.append("Running: " + " ".join(shlex.quote(a) for a in args))
+        self.proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                     text=True, bufsize=1, cwd=APP_DIR)
+        threading.Thread(target=self._reader, args=(self.proc,), daemon=True).start()
+
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            self.append("Sent terminate signal.")
         else:
-            messagebox.showinfo("Debug log", "No log file found yet.")
+            self.append("Not running.")
 
-    def on_auth(self) -> None:
-        api_key = self.vars["api_key"].get().strip()
-        api_secret = self.vars["api_secret"].get().strip()
-        if not api_key or not api_secret:
-            messagebox.showerror("Missing", "Enter API key and secret first.")
-            return
+    def create_task(self):
+        vals = {
+            "input": self.input_var.get().strip(),
+            "since": self.since_var.get().strip(),
+            "until": self.until_var.get().strip(),
+            "limit": self.limit_var.get().strip(),
+            "include_duration": self.inc_dur_var.get(),
+            "no_chosen": self.no_chosen_var.get(),
+            "debug": self.debug_var.get(),
+            "import_mode": self.import_var.get(),
+            "gap": int(self.gap_var.get() or "1"),
+            "finish_at": self.finish_var.get().strip() or "now",
+            "state_file": self.state_var.get().strip(),
+        }
+        args = build_args(vals)
+        cmdline = " ".join(shlex.quote(a) for a in args)
+        bat_path = os.path.join(APP_DIR, "run_lastfm_import.bat")
+        with open(bat_path, "w", encoding="utf-8") as f:
+            f.write(f'@echo off\ncd /d "{APP_DIR}"\n{cmdline} >> run.log 2>&1\n')
+        schtasks = [
+            "schtasks", "/Create", "/F", "/SC", "ONLOGON", "/RL", "HIGHEST",
+            "/TN", "LastFm Import Resume",
+            "/TR", rf"\"%SystemRoot%\System32\cmd.exe\" /c \"{bat_path}\""
+        ]
         try:
-            sk = authenticate_interactively(api_key, api_secret)
-            self.vars["session_key"].set(sk)
-            cfg = load_config(); cfg.update({"api_key": api_key, "api_secret": api_secret, "session_key": sk}); save_config(cfg)
-            messagebox.showinfo("Authenticated", "Authorization successful and saved.")
-        except Exception as exc:
-            messagebox.showerror("Auth failed", str(exc))
-
-    def on_reset_auth(self) -> None:
-        delete_config(); self.vars["session_key"].set(""); messagebox.showinfo("Reset", "Cleared cached credentials.")
-
-    def on_probe(self) -> None:
-        api_key = self.vars["api_key"].get().strip(); api_secret = self.vars["api_secret"].get().strip()
-        if not api_key or not api_secret:
-            messagebox.showerror("Missing", "Enter API key and secret first.")
-            return
-        # Reuse CLI probe by calling a tiny run in a thread
-        self._run_thread(self._worker_probe, api_key, api_secret, self.vars["session_key"].get().strip())
-
-    def on_start(self) -> None:
-        api_key = self.vars["api_key"].get().strip(); api_secret = self.vars["api_secret"].get().strip()
-        if not api_key or not api_secret:
-            messagebox.showerror("Missing", "Enter API key and secret first.")
-            return
-        if not self.selected_paths:
-            messagebox.showerror("Missing", "Select files or a folder.")
-            return
-        self.btn_start.configure(state="disabled")
-        self.progress.configure(value=0, maximum=100)
-        self.txt.delete("1.0", "end")
-        self._run_thread(self._worker_start, api_key, api_secret, self.vars["session_key"].get().strip(), list(self.selected_paths))
-
-    def _run_thread(self, target, *args):
-        t = threading.Thread(target=target, args=args, daemon=True)
-        t.start()
-
-    # Workers
-    def _worker_probe(self, api_key: str, api_secret: str, session_key: str) -> None:
-        try:
-            from spotify_lastfm_scrobbler import run_probe
-            run_probe(api_key, api_secret, session_key, debug=self.vars["debug"].get())
-            self.log("Probe sent. Check Last.fm recent tracks and the debug log if enabled.")
-        except Exception as exc:
-            self.log(f"Probe failed: {exc}")
-
-    def _worker_start(self, api_key: str, api_secret: str, session_key: str, paths: List[str]) -> None:
-        try:
-            if not session_key:
-                self.log("No session key — starting interactive auth...")
-                sk = authenticate_interactively(api_key, api_secret)
-                session_key = sk
-                cfg = load_config(); cfg.update({"api_key": api_key, "api_secret": api_secret, "session_key": sk}); save_config(cfg)
-                self.vars["session_key"].set(sk)
-
-            # Collect inputs
-            path_objs: List[Path] = []
-            for p in paths:
-                po = Path(p)
-                path_objs.append(po)
-
-            self.log(f"Reading inputs ({len(path_objs)})...")
-            entries = parse_streaming_history(path_objs)
-            self.log(f"Loaded {len(entries)} total entries.")
-
-            scrobs = [e for e in entries if should_scrobble(e)]
-            self.log(f"{len(scrobs)} entries qualify for scrobbling.")
-            if not scrobs:
-                self.log("Nothing to scrobble.")
-                self.btn_start.configure(state="normal"); return
-
-            # Range filter, dedupe
-            since = self.vars["since"].get().strip() or None
-            until = self.vars["until"].get().strip() or None
-            def within(ts: int) -> bool:
-                from spotify_lastfm_scrobbler import within_range
-                return within_range(ts, since, until)
-
-            seen = set(); unique: List[dict] = []
-            for e in scrobs:
-                ts = compute_start_timestamp(e)
-                if not within(ts):
-                    continue
-                key = (e.get("master_metadata_album_artist_name"), e.get("master_metadata_track_name"), ts)
-                if key not in seen:
-                    seen.add(key)
-                    unique.append(e)
-
-            unique.sort(key=lambda e: compute_start_timestamp(e))
-            limit_s = self.vars["limit"].get().strip()
-            if limit_s:
-                try:
-                    unique = unique[: max(0, int(limit_s))]
-                except Exception:
-                    pass
-
-            total = len(unique)
-            self.log(f"{total} unique scrobbles after removing duplicates.")
-            if total == 0:
-                self.btn_start.configure(state="normal"); return
-
-            submitted = 0
-            for i in range(0, total, 50):
-                batch = unique[i : i + 50]
-                self.log(f"Submitting scrobbles {i+1}–{i+len(batch)} of {total}...")
-                res = submit_batch(
-                    batch,
-                    api_key,
-                    api_secret,
-                    session_key,
-                    dry_run=self.vars["dry_run"].get(),
-                    debug=self.vars["debug"].get(),
-                    include_duration=self.vars["include_duration"].get(),
-                    send_chosen=(not self.vars["no_chosen"].get()),
-                )
-                if res.get("accepted", 0) > 0:
-                    submitted += min(50, len(batch))
-                else:
-                    self.log(f"Warning: accepted={res.get('accepted',0)} ignored={res.get('ignored',0)}")
-                self.progress.configure(value=(i + len(batch)) * 100 / max(1, total))
-                time.sleep(0.5 if not self.vars["dry_run"].get() else 0)
-
-            self.log("Finished. " + (f"{submitted} processed (dry-run)." if self.vars["dry_run"].get() else f"{submitted} scrobbles submitted."))
-        except Exception as exc:
-            self.log(f"Error: {exc}")
-        finally:
-            self.btn_start.configure(state="normal")
-
-
-def main() -> None:
-    app = ScrobbleGUI()
-    app.mainloop()
-
+            out = subprocess.check_output(schtasks, text=True, stderr=subprocess.STDOUT)
+            messagebox.showinfo("Startup task", "Created/updated startup task.\n\n" + out)
+        except subprocess.CalledProcessError as e:
+            messagebox.showerror("Failed", f"Could not create task.\n\n{e.output}")
 
 if __name__ == "__main__":
-    main()
+    App().mainloop()

@@ -1,4 +1,3 @@
-# --- FILE: spotify_lastfm_scrobbler.py ---
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -15,6 +14,7 @@ Highlights in this patched build:
 - Safer timestamp computation (handles str/int/datetime 'ts'; prefers offline_timestamp when sane).
 - ZIP/dir recursion; skips video history; de-dup by (artist, track, ts).
 - Import mode: re-date plays to recent times (like Scrubbler’s ImportMode).
+- Resumable with state file + automatic backoff on 429 / error=29 (waits to UTC midnight when hammered).
 """
 
 from __future__ import annotations
@@ -41,6 +41,7 @@ SESSION.headers.update({"User-Agent": USER_AGENT})
 
 SIGNING_SKIP = {"format", "callback"}
 DEBUG_LOG = Path("scrobble_debug.log")
+STATE_FILE_DEFAULT = "lastfm_resume_state.json"
 
 # ---------------------------
 # Utilities
@@ -48,6 +49,38 @@ DEBUG_LOG = Path("scrobble_debug.log")
 
 def md5_hex(s: str) -> str:
     return hashlib.md5(s.encode("utf-8")).hexdigest()
+
+
+def dataset_signature(paths: list[Path], since: str | None, until: str | None) -> str:
+    """Fast, stable signature of input set + date filters (path, size, mtime)."""
+    parts = [f"SINCE={since or ''}", f"UNTIL={until or ''}"]
+    for p in sorted(paths, key=lambda x: str(x).lower()):
+        try:
+            st = p.stat()
+            parts.append(f"{p.resolve()}|{st.st_size}|{int(st.st_mtime)}")
+        except Exception:
+            parts.append(f"{p.resolve()}|MISSING")
+    return md5_hex("\n".join(parts))
+
+
+def load_state(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_state(path: Path, data: dict) -> None:
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def seconds_until_next_utc_midnight() -> int:
+    now = dt.datetime.now(dt.timezone.utc)
+    nxt = (now + dt.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return max(60, int((nxt - now).total_seconds()))  # at least 60s
+
 
 def load_config() -> Dict[str, str]:
     if CONFIG_FILE.exists():
@@ -57,8 +90,10 @@ def load_config() -> Dict[str, str]:
             return {}
     return {}
 
+
 def save_config(cfg: Dict[str, str]) -> None:
     CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
 
 def delete_config() -> None:
     try:
@@ -67,6 +102,7 @@ def delete_config() -> None:
     except Exception:
         pass
 
+
 def log_debug(line: str) -> None:
     try:
         DEBUG_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -74,6 +110,7 @@ def log_debug(line: str) -> None:
             lf.write(line + "\n")
     except Exception:
         pass
+
 
 def parse_spotify_iso(ts: str) -> dt.datetime:
     """
@@ -97,36 +134,54 @@ def build_api_sig(params: Dict[str, str], api_secret: str) -> str:
     sig_str = "".join(k + v for k, v in items) + api_secret
     return md5_hex(sig_str)
 
+
 def lastfm_post(params: Dict[str, str], api_secret: str, timeout: int = 30) -> requests.Response:
     params = dict(params)
     params["api_sig"] = build_api_sig(params, api_secret)
     return SESSION.post(LASTFM_API_ROOT, data=params, timeout=timeout)
 
+
 def request_token(api_key: str, api_secret: str) -> str:
     payload = {"method": "auth.getToken", "api_key": api_key}
-    r = lastfm_post(payload, api_secret); r.raise_for_status()
+    r = lastfm_post(payload, api_secret)
+    r.raise_for_status()
     data = r.json()
-    return data.get("token") or data.get("lfm", {}).get("token") or (_ for _ in ()).throw(RuntimeError(f"Could not obtain token: {data}"))
+    token = data.get("token") or data.get("lfm", {}).get("token")
+    if not token:
+        raise RuntimeError(f"Could not obtain token: {data}")
+    return token
+
 
 def request_session_key(api_key: str, api_secret: str, token: str) -> Tuple[str, str]:
     payload = {"method": "auth.getSession", "api_key": api_key, "token": token}
-    r = lastfm_post(payload, api_secret); r.raise_for_status()
+    r = lastfm_post(payload, api_secret)
+    r.raise_for_status()
     data = r.json()
     sess = data.get("session") or data.get("lfm", {}).get("session")
     if not sess:
         raise RuntimeError(f"Could not obtain session: {data}")
-    username, session_key = sess.get("name"), sess.get("key")
+    username = sess.get("name")
+    session_key = sess.get("key")
     if not username or not session_key:
         raise RuntimeError(f"Incomplete session response: {data}")
     return username, session_key
 
+
 def authenticate_interactively(api_key: str, api_secret: str) -> str:
     print("Requesting authorization token...")
     token = request_token(api_key, api_secret)
-    auth_url = f"https://www.last.fm/api/auth/?api_key={urllib.parse.quote(api_key)}&token={urllib.parse.quote(token)}"
-    print("Open this URL and click 'Allow Access':"); print(auth_url)
-    try: webbrowser.open(auth_url)
-    except Exception: pass
+    auth_url = (
+        "https://www.last.fm/api/auth/?api_key="
+        + urllib.parse.quote(api_key)
+        + "&token="
+        + urllib.parse.quote(token)
+    )
+    print("Open this URL and click 'Allow Access':")
+    print(auth_url)
+    try:
+        webbrowser.open(auth_url)
+    except Exception:
+        pass
     input("After approving, press Enter to continue...")
     print("Exchanging token for session key...")
     username, session_key = request_session_key(api_key, api_secret, token)
@@ -171,13 +226,16 @@ def parse_streaming_history(paths: Iterable[Path]) -> List[Dict[str, Optional[st
             print(f"Error reading {p}: {exc}")
     return entries
 
+
 def _read_zip_items(zippath: Path) -> List[Dict[str, Optional[str]]]:
     out: List[Dict[str, Optional[str]]] = []
     try:
         with zipfile.ZipFile(zippath, "r") as zf:
             for name in zf.namelist():
-                if not name.lower().endswith(".json"): continue
-                if "Streaming_History_Video" in name: continue
+                if not name.lower().endswith(".json"):
+                    continue
+                if "Streaming_History_Video" in name:
+                    continue
                 try:
                     with zf.open(name) as zfh:
                         raw = zfh.read().decode("utf-8")
@@ -190,11 +248,13 @@ def _read_zip_items(zippath: Path) -> List[Dict[str, Optional[str]]]:
         print(f"Error opening zip {zippath}: {exc}")
     return out
 
+
 def is_private(entry: Dict[str, Optional[str]]) -> bool:
     v = entry.get("incognito_mode")
     if v is None:
         v = entry.get("is_private_session")
     return bool(v)
+
 
 def should_scrobble(entry: Dict[str, Optional[str]]) -> bool:
     """
@@ -219,6 +279,7 @@ def should_scrobble(entry: Dict[str, Optional[str]]) -> bool:
     if is_private(entry):
         return False
     return True
+
 
 def compute_start_timestamp(entry: Dict[str, Optional[str]]) -> int:
     """
@@ -274,6 +335,7 @@ def parse_finish_at(s: str | None) -> int:
         d = d.replace(tzinfo=dt.timezone.utc)
     return int(d.astimezone(dt.timezone.utc).timestamp())
 
+
 def apply_import_mode(scrobbles: list[dict], finish_at: str | None, gap_sec: int | None) -> None:
     """
     Rewrite timestamps in-place so that items are evenly spaced and end at finish_at.
@@ -328,8 +390,10 @@ def build_scrobble_params(
                 pass
     return params
 
+
 def _redacted(params: Dict[str, str]) -> Dict[str, str]:
     return {k: v for k, v in params.items() if k.lower() not in {"api_sig", "sk"}}
+
 
 def submit_batch(
     batch: List[Dict[str, Optional[str]]],
@@ -341,8 +405,12 @@ def submit_batch(
     debug: bool = False,
     include_duration: bool = False,
     send_chosen: bool = True,
+    max_attempts: int = 1000000,   # effectively "until done"
 ) -> Dict[str, int]:
-    """Submit a batch; returns dict with accepted/ignored."""
+    """
+    Submit a batch (<=50); auto-retries on HTTP 429 and Last.fm error=29 (rate limit).
+    Returns {"accepted": X, "ignored": Y}. On dry-run, returns {"accepted":0,"ignored":len(batch)}.
+    """
     params = build_scrobble_params(batch, api_key, api_secret, session_key, include_duration, send_chosen)
 
     if dry_run:
@@ -350,39 +418,89 @@ def submit_batch(
             log_debug("[DRY_RUN] REQUEST PARAMS (redacted): " + json.dumps(_redacted(params), ensure_ascii=False))
         return {"accepted": 0, "ignored": len(batch)}
 
-    if debug:
-        log_debug("REQUEST PARAMS (redacted): " + json.dumps(_redacted(params), ensure_ascii=False)[:6000])
+    attempt = 0
+    consec_429 = 0
+    backoff = 30  # seconds, grows exponentially with jitter up to 3600
 
-    resp = lastfm_post(params, api_secret)
-    text = resp.text
-    if debug:
-        log_debug("RESPONSE TEXT: " + text[:12000])
-    resp.raise_for_status()
-    data = resp.json()
+    while True:
+        attempt += 1
+        if debug:
+            log_debug("REQUEST PARAMS (redacted): " + json.dumps(_redacted(params), ensure_ascii=False)[:6000])
+        try:
+            resp = lastfm_post(params, api_secret)
+            text = resp.text
+            if debug:
+                log_debug("RESPONSE TEXT: " + text[:12000])
 
-    scrob = data.get("scrobbles") or data.get("lfm", {}).get("scrobbles")
-    if isinstance(scrob, dict):
-        attr = scrob.get("@attr") or {}
-        accepted = int(attr.get("accepted") or 0)
-        ignored = int(attr.get("ignored") or 0)
-        if accepted == 0:
-            payload = scrob.get("scrobble")
-            items = payload if isinstance(payload, list) else ([payload] if payload else [])
-            reason = None
-            for it in items:
-                msg = (it or {}).get("ignoredMessage", {})
-                if msg.get("code") and msg.get("code") != "0":
-                    reason = {"code": msg.get("code"), "text": msg.get("#text", "")}
-                    break
-            print(f"Warning: batch ignored: accepted={accepted}, ignored={ignored}, first reason={reason}")
-        return {"accepted": accepted, "ignored": ignored}
+            # If HTTP says "too many requests", use headers and retry.
+            if resp.status_code == 429:
+                consec_429 += 1
+                retry_after = resp.headers.get("Retry-After")
+                if retry_after:
+                    wait = max(5, int(float(retry_after)))
+                else:
+                    wait = min(3600, int(backoff))
+                    backoff = min(3600, int(backoff * 2))
+                print(f"Rate limited (HTTP 429). Sleeping {wait}s...")
+                time.sleep(wait)
+                # If we keep getting hammered, assume daily limit & wait to UTC midnight.
+                if consec_429 >= 6:
+                    midnight_wait = seconds_until_next_utc_midnight()
+                    print(f"Still rate-limited after several attempts. Sleeping until next UTC midnight (~{midnight_wait}s)...")
+                    time.sleep(midnight_wait)
+                    consec_429 = 0
+                continue
 
-    status = data.get("lfm", {}).get("status")
-    if status == "ok":
-        return {"accepted": len(batch), "ignored": 0}
+            resp.raise_for_status()
+            data = resp.json()
 
-    print(f"Warning: unexpected response: {data}")
-    return {"accepted": 0, "ignored": len(batch)}
+            # Some rate limits are 200 + body error=29.
+            if isinstance(data, dict) and (data.get("error") == 29 or data.get("lfm", {}).get("error") == 29):
+                consec_429 += 1
+                wait = min(3600, int(backoff))
+                backoff = min(3600, int(backoff * 2))
+                print(f"Rate limited (error=29). Sleeping {wait}s...")
+                time.sleep(wait)
+                if consec_429 >= 6:
+                    midnight_wait = seconds_until_next_utc_midnight()
+                    print(f"Still rate-limited after several attempts. Sleeping until next UTC midnight (~{midnight_wait}s)...")
+                    time.sleep(midnight_wait)
+                    consec_429 = 0
+                continue
+
+            # Normal success path
+            scrob = data.get("scrobbles") or data.get("lfm", {}).get("scrobbles")
+            if isinstance(scrob, dict):
+                attr = scrob.get("@attr") or {}
+                accepted = int(attr.get("accepted") or 0)
+                ignored = int(attr.get("ignored") or 0)
+                if accepted == 0:
+                    payload = scrob.get("scrobble")
+                    items = payload if isinstance(payload, list) else ([payload] if payload else [])
+                    reason = None
+                    for it in items:
+                        msg = (it or {}).get("ignoredMessage", {})
+                        if msg.get("code") and msg.get("code") != "0":
+                            reason = {"code": msg.get("code"), "text": msg.get("#text", "")}
+                            break
+                    print(f"Warning: batch ignored: accepted={accepted}, ignored={ignored}, first reason={reason}")
+                return {"accepted": accepted, "ignored": ignored}
+
+            status = data.get("lfm", {}).get("status")
+            if status == "ok":
+                return {"accepted": len(batch), "ignored": 0}
+
+            print(f"Warning: unexpected response: {data}")
+            return {"accepted": 0, "ignored": len(batch)}
+
+        except requests.RequestException as e:
+            # Network wiggle room: back off and retry.
+            if attempt >= max_attempts:
+                raise
+            wait = min(300, 5 * attempt)  # up to 5 minutes for transient network errors
+            print(f"Network error ({e.__class__.__name__}). Sleeping {wait}s then retrying...")
+            time.sleep(wait)
+            continue
 
 # ---------------------------
 # CLI
@@ -405,6 +523,7 @@ def within_range(ts_sec: int, since_str: Optional[str], until_str: Optional[str]
             pass
     return True
 
+
 def run_probe(api_key: str, api_secret: str, session_key: Optional[str], debug: bool = False) -> None:
     if not session_key:
         session_key = authenticate_interactively(api_key, api_secret)
@@ -420,6 +539,7 @@ def run_probe(api_key: str, api_secret: str, session_key: Optional[str], debug: 
     }
     res = submit_batch([probe_entry], api_key, api_secret, session_key, dry_run=False, debug=debug, include_duration=True, send_chosen=False)
     print(f"[probe] accepted={res['accepted']} ignored={res['ignored']}")
+
 
 def main() -> None:
     p = argparse.ArgumentParser(
@@ -442,6 +562,7 @@ def main() -> None:
     p.add_argument("--import-mode", action="store_true", help="Re-date plays to recent times for Last.fm import (like Scrubbler).")
     p.add_argument("--finish-at", default="now", help='When the last scrobble should appear (ISO datetime or "now").')
     p.add_argument("--gap-sec", type=int, default=1, help="Seconds between re-dated scrobbles in import mode (default: 1).")
+    p.add_argument("--state-file", default=STATE_FILE_DEFAULT, help="Path to a resume/progress file.")
 
     args = p.parse_args()
 
@@ -472,6 +593,11 @@ def main() -> None:
         print("Error: no valid inputs")
         raise SystemExit(2)
 
+    state_path = Path(args.state_file)
+    sig = dataset_signature(inputs, args.since, args.until)
+    state = load_state(state_path)
+    resume_offset = int(state.get("offset") or 0) if state.get("sig") == sig else 0
+
     if not session_key:
         try:
             session_key = authenticate_interactively(api_key, api_secret)
@@ -497,7 +623,8 @@ def main() -> None:
             continue
         key = (e.get("master_metadata_album_artist_name"), e.get("master_metadata_track_name"), ts)
         if key not in seen:
-            seen.add(key); unique.append(e)
+            seen.add(key)
+            unique.append(e)
 
     if not unique:
         print("Nothing to scrobble after filtering.")
@@ -510,18 +637,29 @@ def main() -> None:
         unique = unique[: max(0, args.limit)]
 
     if args.import_mode:
+        # In a one-shot run, you can predate all items. For resume runs we re-date only the tail below.
         apply_import_mode(unique, args.finish_at, args.gap_sec)
         if args.debug and unique:
             preview = [unique[i].get("_ts_override") for i in range(min(3, len(unique)))]
-            tail = [unique[-i].get("_ts_override") for i in range(min(3, len(unique)), 0, -1)]
-            log_debug(f"[IMPORT_MODE] first/last overrides: {preview} ... {tail}")
+            tail_marks = [unique[-i].get("_ts_override") for i in range(min(3, len(unique)), 0, -1)]
+            log_debug(f"[IMPORT_MODE] first/last overrides: {preview} ... {tail_marks}")
 
-    total = len(unique)
+    total_all = len(unique)
+
+    if resume_offset:
+        print(f"Resuming from offset {resume_offset} based on state file '{state_path}'.")
+    tail = unique[resume_offset:]  # what's left to send
+
+    # If resuming with import mode, re-date the remaining items so earlier scrobbles keep their stored times
+    if args.import_mode and tail:
+        apply_import_mode(tail, args.finish_at, args.gap_sec)
+
+    total = len(tail)
     submitted = 0
-
     for i in range(0, total, 50):
-        batch = unique[i : i + 50]
-        print(f"Submitting scrobbles {i+1}–{i+len(batch)} of {total}...")
+        batch = tail[i : i + 50]
+        absolute_start = resume_offset + i + 1
+        print(f"Submitting scrobbles {absolute_start}–{resume_offset + i + len(batch)} of {resume_offset + total}...")
         res = submit_batch(
             batch,
             api_key,
@@ -532,11 +670,27 @@ def main() -> None:
             include_duration=args.include_duration,
             send_chosen=(not args.no_chosen_by_user),
         )
-        if res.get("accepted", 0) > 0:
-            submitted += min(50, len(batch))
-        time.sleep(0.5 if not args.dry_run else 0)
+        accepted = int(res.get("accepted") or 0)
+        ignored = int(res.get("ignored") or 0)
+        if accepted > 0:
+            submitted += accepted
+            # persist progress **based on how many were accepted**
+            save_state(state_path, {
+                "sig": sig,
+                "offset": resume_offset + i + accepted,
+                "import_mode": bool(args.import_mode),
+                "gap_sec": int(args.gap_sec or 1),
+                "finish_at": args.finish_at,
+                "since": args.since,
+                "until": args.until,
+                "include_duration": bool(args.include_duration),
+                "no_chosen_by_user": bool(args.no_chosen_by_user),
+                "updated_at_utc": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00","Z"),
+            })
+        time.sleep(0 if args.dry_run else 0.5)
 
     print("Finished. " + (f"{submitted} scrobbles processed (dry-run)." if args.dry_run else f"{submitted} scrobbles submitted."))
+
 
 if __name__ == "__main__":
     main()
