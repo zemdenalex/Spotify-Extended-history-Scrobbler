@@ -1,17 +1,4 @@
 #!/usr/bin/env python3
-"""
-A minimal Tkinter front‑end for the spotify_lastfm_scrobbler.
-
-This GUI wraps the core functionality in a simple window that asks for
-your Last.fm API credentials and lets you choose a directory, zip
-archive or individual JSON files containing your Spotify streaming
-history.  Progress messages are displayed in a scrolling text area.
-
-Run this script directly with Python or package it along with
-spotify_lastfm_scrobbler.py using PyInstaller (see instructions in
-spotify_lastfm_scrobbler.py).  Both files must reside in the same
-directory so that the GUI can import the scrobbling functions.
-"""
 
 import os
 import threading
