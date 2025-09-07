@@ -1,1 +1,41 @@
-__pycache__
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual env / local config
+.venv/
+venv/
+env/
+.env
+.env.*
+*.env
+*.ini
+*.toml
+
+# Build / packaging
+build/
+dist/
+*.spec
+*.exe
+*.dll
+
+# Editors / OS cruft
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Local credentials / caches (match your script if you change filenames)
+lastfm_credentials.json
+lastfm_session*.json
+config/*.json
+
+# User data (do NOT commit your history)
+Streaming_History_*.json
+MyData*/
+*.zip
